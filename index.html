@@ -934,97 +934,123 @@ function analyzeAndScore() {
   const ref = BIRD_FEATURES[birdId];
 
   setTimeout(() => {
-    const blob = new Blob(G.chunks, {type:'audio/webm'});
+    const mimeType = (G.recorder && G.recorder.mimeType) || 'audio/webm';
+    const blob = new Blob(G.chunks, {type: mimeType});
     const reader = new FileReader();
     reader.onload = () => {
-      const ctx = new (window.AudioContext||window.webkitAudioContext)();
-      ctx.decodeAudioData(reader.result).then(buf => {
-        const data = buf.getChannelData(0);
-        const sr   = buf.sampleRate;
-        const n    = data.length;
-
-        // 1. Overall RMS — silent?
-        let s2=0; for(let i=0;i<n;i++) s2+=data[i]*data[i];
-        const rms = Math.sqrt(s2/n);
-        if (rms < 0.006) {
-          ctx.close();
-          showScore(5+Math.floor(Math.random()*10),'silent',pickOne(CMTS.silent));
-          return;
-        }
-
-        // 2. Frame loudness → 20 buckets
-        const fSz = Math.floor(sr*0.05);
-        const fCnt = Math.floor(n/fSz);
-        const frameRMS = [];
-        for(let f=0;f<fCnt;f++){
-          let s=0; const st=f*fSz,en=st+fSz;
-          for(let i=st;i<en;i++) s+=data[i]*data[i];
-          frameRMS.push(Math.sqrt(s/fSz));
-        }
-        const maxF = Math.max(...frameRMS,1e-9);
-        const normF = frameRMS.map(v=>v/maxF);
-
-        const bs = Math.max(1,Math.floor(normF.length/20));
-        const userBuckets = [];
-        for(let i=0;i<20;i++){
-          const ch = normF.slice(i*bs,(i+1)*bs);
-          userBuckets.push(ch.length? ch.reduce((a,b)=>a+b,0)/ch.length : 0);
-        }
-
-        // 3. Centred cosine similarity
-        const refB = ref.buckets;
-        const uMean = userBuckets.reduce((a,b)=>a+b,0)/20;
-        const rMean = refB.reduce((a,b)=>a+b,0)/20;
-        const uC = userBuckets.map(v=>v-uMean);
-        const rC = refB.map(v=>v-rMean);
-        let dot=0,nu=0,nr=0;
-        for(let i=0;i<20;i++){
-          dot+=uC[i]*rC[i]; nu+=uC[i]*uC[i]; nr+=rC[i]*rC[i];
-        }
-        const cosine = (Math.sqrt(nu)<1e-4 || Math.sqrt(nr)<1e-4)
-          ? 0
-          : Math.max(0, dot/(Math.sqrt(nu)*Math.sqrt(nr)+1e-9));
-
-        // 4. Variance (loudness dynamics)
-        const uAvg = userBuckets.reduce((a,b)=>a+b,0)/20;
-        const uStd = Math.sqrt(userBuckets.reduce((s,v)=>s+(v-uAvg)**2,0)/20);
-        const varScoreRelaxed = Math.min(1, uStd / 0.04);
-
-        // 5. Intermittency (rhythm transitions)
-        const THR = 0.08;
-        let transitions = 0;
-        let prevActive = normF[0] > THR;
-        for(let i=1;i<normF.length;i++){
-          const active = normF[i] > THR;
-          if (active && !prevActive) transitions++;
-          prevActive = active;
-        }
-        const transScore = Math.min(1, (transitions + 1) / 4);
-
-        // 6. Zero-crossing rate
-        let zc=0; for(let i=1;i<n;i++) if((data[i]>=0)!==(data[i-1]>=0)) zc++;
-        const userZcr = zc/n;
-        const zcrRef  = ref.zcr * 0.12;
-        const zcrScore = Math.min(1, userZcr>0 ? Math.min(userZcr,zcrRef)/Math.max(userZcr,zcrRef+1e-9) : 0);
-
-        // Composite
-        const composite = cosine          * 0.35
-                        + varScoreRelaxed * 0.25
-                        + transScore      * 0.25
-                        + zcrScore        * 0.15;
-
-        const base  = Math.round(42 + composite * 50);
-        const noise = Math.round((Math.random()-.5)*8);
-        const score = Math.max(38, Math.min(95, base+noise));
-
-        ctx.close();
-        showScore(score,'normal',pickOne(CMTS[score>=82?'excellent':score>=65?'good':score>=42?'mid':'low']));
-
-      }).catch((err)=>{
-        console.warn('Audio decode failed, using fallback score', err);
+      const fallback = () => {
         const s = 42 + Math.floor(Math.random()*20);
         showScore(s,'normal',pickOne(CMTS.mid));
-      });
+      };
+      // Guard: ensure we always show a score even if nothing below responds
+      const safetyTimer = setTimeout(() => {
+        console.warn('Audio decode timed out, using fallback score');
+        fallback();
+      }, 5000);
+      try {
+        const ctx = new (window.AudioContext||window.webkitAudioContext)();
+        // Use callback form of decodeAudioData (universally supported) wrapped in a
+        // Promise to avoid the Promise-API hanging issue on some desktop browsers.
+        new Promise((resolve, reject) => {
+          ctx.decodeAudioData(reader.result, resolve, reject);
+        }).then(buf => {
+          clearTimeout(safetyTimer);
+          const data = buf.getChannelData(0);
+          const sr   = buf.sampleRate;
+          const n    = data.length;
+
+          // 1. Overall RMS — silent?
+          let s2=0; for(let i=0;i<n;i++) s2+=data[i]*data[i];
+          const rms = Math.sqrt(s2/n);
+          if (rms < 0.006) {
+            ctx.close();
+            showScore(5+Math.floor(Math.random()*10),'silent',pickOne(CMTS.silent));
+            return;
+          }
+
+          // 2. Frame loudness → 20 buckets
+          const fSz = Math.floor(sr*0.05);
+          const fCnt = Math.floor(n/fSz);
+          const frameRMS = [];
+          for(let f=0;f<fCnt;f++){
+            let s=0; const st=f*fSz,en=st+fSz;
+            for(let i=st;i<en;i++) s+=data[i]*data[i];
+            frameRMS.push(Math.sqrt(s/fSz));
+          }
+          const maxF = Math.max(...frameRMS,1e-9);
+          const normF = frameRMS.map(v=>v/maxF);
+
+          const bs = Math.max(1,Math.floor(normF.length/20));
+          const userBuckets = [];
+          for(let i=0;i<20;i++){
+            const ch = normF.slice(i*bs,(i+1)*bs);
+            userBuckets.push(ch.length? ch.reduce((a,b)=>a+b,0)/ch.length : 0);
+          }
+
+          // 3. Centred cosine similarity
+          const refB = ref.buckets;
+          const uMean = userBuckets.reduce((a,b)=>a+b,0)/20;
+          const rMean = refB.reduce((a,b)=>a+b,0)/20;
+          const uC = userBuckets.map(v=>v-uMean);
+          const rC = refB.map(v=>v-rMean);
+          let dot=0,nu=0,nr=0;
+          for(let i=0;i<20;i++){
+            dot+=uC[i]*rC[i]; nu+=uC[i]*uC[i]; nr+=rC[i]*rC[i];
+          }
+          const cosine = (Math.sqrt(nu)<1e-4 || Math.sqrt(nr)<1e-4)
+            ? 0
+            : Math.max(0, dot/(Math.sqrt(nu)*Math.sqrt(nr)+1e-9));
+
+          // 4. Variance (loudness dynamics)
+          const uAvg = userBuckets.reduce((a,b)=>a+b,0)/20;
+          const uStd = Math.sqrt(userBuckets.reduce((s,v)=>s+(v-uAvg)**2,0)/20);
+          const varScoreRelaxed = Math.min(1, uStd / 0.04);
+
+          // 5. Intermittency (rhythm transitions)
+          const THR = 0.08;
+          let transitions = 0;
+          let prevActive = normF[0] > THR;
+          for(let i=1;i<normF.length;i++){
+            const active = normF[i] > THR;
+            if (active && !prevActive) transitions++;
+            prevActive = active;
+          }
+          const transScore = Math.min(1, (transitions + 1) / 4);
+
+          // 6. Zero-crossing rate
+          let zc=0; for(let i=1;i<n;i++) if((data[i]>=0)!==(data[i-1]>=0)) zc++;
+          const userZcr = zc/n;
+          const zcrRef  = ref.zcr * 0.12;
+          const zcrScore = Math.min(1, userZcr>0 ? Math.min(userZcr,zcrRef)/Math.max(userZcr,zcrRef+1e-9) : 0);
+
+          // Composite
+          const composite = cosine          * 0.35
+                          + varScoreRelaxed * 0.25
+                          + transScore      * 0.25
+                          + zcrScore        * 0.15;
+
+          const base  = Math.round(42 + composite * 50);
+          const noise = Math.round((Math.random()-.5)*8);
+          const score = Math.max(38, Math.min(95, base+noise));
+
+          ctx.close();
+          showScore(score,'normal',pickOne(CMTS[score>=82?'excellent':score>=65?'good':score>=42?'mid':'low']));
+
+        }).catch((err)=>{
+          clearTimeout(safetyTimer);
+          console.warn('Audio decode failed, using fallback score', err);
+          fallback();
+        });
+      } catch(err) {
+        clearTimeout(safetyTimer);
+        console.warn('Audio processing error, using fallback score', err);
+        fallback();
+      }
+    };
+    reader.onerror = () => {
+      console.warn('FileReader error, using fallback score');
+      const s = 42 + Math.floor(Math.random()*20);
+      showScore(s,'normal',pickOne(CMTS.mid));
     };
     reader.readAsArrayBuffer(blob);
   }, 1500);
